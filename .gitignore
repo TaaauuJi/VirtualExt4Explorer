@@ -1,0 +1,24 @@
+# directory
+build/
+imgui/
+lwext4/
+
+# Visual Studio files
+.vs/
+*.user
+*.suo
+*.db
+*.opendb
+*.sln
+*.vcxproj*
+
+# Compiled files (just in case they are compiled outside build/)
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.res
+*.lib
+
+# Runtime settings/outputs
+imgui.ini
