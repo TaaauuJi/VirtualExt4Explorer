@@ -1,7 +1,3 @@
-```
-
-```
-
 # Virtual Ext4 Explorer
 
 **Virtual Ext4 Explorer** is a high-performance, standalone C++ utility designed to bridge the gap between Windows and Linux virtual environments. It provides a seamless, GUI to manage **ext4** filesystems encapsulated within various virtual disk formats.
