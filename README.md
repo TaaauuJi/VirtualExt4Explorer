@@ -101,7 +101,7 @@ The script uses `/O1` optimization for minimum size and `/MT` for static runtime
 
 ## 📜 License
 
-This project is licensed under the **GPLv3 License**.
+This project is licensed under the **[GPLv3 License](LICENSE)**.
 
 ## 🤝 Credits
 
