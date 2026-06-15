@@ -33,10 +33,10 @@
 - **Shortcuts:** Supports Mouse Side Buttons (X1/X2) and `Alt + Arrow` keys for browser-like navigation.
 - **Multi-Selection:** Standard `Ctrl + Click` and `Shift + Click` (range selection) support.
 - **Visual Cues:** Color-coded entries:
-  - `<span style="color:gold">`**Folders (Gold)**
-  - `<span style="color:green">`**Executables (Green)**
-  - `<span style="color:orange">`**Archives (Orange)**
-  - `<span style="color:pink">`**Libraries (Pink)**
+  - 🟡 **Folders (Gold)**
+  - 🟢 **Executables (Green)**
+  - 🟠 **Archives (Orange)**
+  - 💗 **Libraries (Pink)**
 
 ---
 
