@@ -320,62 +320,144 @@ int VHDManager::BlockOpen(struct ext4_blockdev* bdev) { return EOK; }
 int VHDManager::BlockClose(struct ext4_blockdev* bdev) { return EOK; }
 int VHDManager::BlockRead(struct ext4_blockdev* bdev, void* buf, uint64_t blk_id, uint32_t blk_cnt) {
     VHDBlockDevice* vhd = (VHDBlockDevice*)bdev->bdif->p_user; uint8_t* out = (uint8_t*)buf;
-    for (uint32_t i = 0; i < blk_cnt; i++) {
-        uint64_t voff = vhd->partition_offset + ((blk_id + i) * 512); uint64_t poff;
+    uint32_t i = 0;
+    while (i < blk_cnt) {
+        uint64_t start_voff = vhd->partition_offset + ((blk_id + i) * 512);
+        uint64_t start_poff;
         if (g_dynVDI.is_vdi) {
-            uint32_t bi = (uint32_t)(voff / g_dynVDI.block_size);
-            uint32_t oi = (uint32_t)(voff % g_dynVDI.block_size);
-            if (bi >= g_dynVDI.blocks_in_image || g_dynVDI.bat[bi] == 0xFFFFFFFF) { memset(out + i*512, 0, 512); continue; }
-            poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
+            uint32_t bi = (uint32_t)(start_voff / g_dynVDI.block_size);
+            uint32_t oi = (uint32_t)(start_voff % g_dynVDI.block_size);
+            if (bi >= g_dynVDI.blocks_in_image || g_dynVDI.bat[bi] == 0xFFFFFFFF) {
+                memset(out + i*512, 0, 512);
+                i++;
+                continue;
+            }
+            start_poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
         } else if (g_dynVHD.is_dynamic) {
-            uint32_t bi = (uint32_t)(voff / g_dynVHD.block_size); uint32_t oi = (uint32_t)(voff % g_dynVHD.block_size);
-            uint32_t bat = g_dynVHD.bat[bi]; if (bat == 0xFFFFFFFF) { memset(out + i*512, 0, 512); continue; }
+            uint32_t bi = (uint32_t)(start_voff / g_dynVHD.block_size);
+            uint32_t oi = (uint32_t)(start_voff % g_dynVHD.block_size);
+            uint32_t bat = g_dynVHD.bat[bi];
+            if (bat == 0xFFFFFFFF) {
+                memset(out + i*512, 0, 512);
+                i++;
+                continue;
+            }
             uint32_t bm = (g_dynVHD.block_size/512+7)/8; bm=(bm+511)/512; if(bm==0) bm=1;
-            poff = (uint64_t)bat*512 + (uint64_t)bm*512 + oi;
-        } else poff = voff;
-        LARGE_INTEGER li; li.QuadPart = poff; SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN);
-        DWORD br; ReadFile(vhd->hFile, out + i*512, 512, &br, NULL);
+            start_poff = (uint64_t)bat*512 + (uint64_t)bm*512 + oi;
+        } else {
+            start_poff = start_voff;
+        }
+
+        // Count contiguous sectors
+        uint32_t run_cnt = 1;
+        while (i + run_cnt < blk_cnt) {
+            uint64_t next_voff = vhd->partition_offset + ((blk_id + i + run_cnt) * 512);
+            uint64_t next_poff;
+            if (g_dynVDI.is_vdi) {
+                uint32_t bi = (uint32_t)(next_voff / g_dynVDI.block_size);
+                uint32_t oi = (uint32_t)(next_voff % g_dynVDI.block_size);
+                if (bi >= g_dynVDI.blocks_in_image || g_dynVDI.bat[bi] == 0xFFFFFFFF) break;
+                next_poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
+            } else if (g_dynVHD.is_dynamic) {
+                uint32_t bi = (uint32_t)(next_voff / g_dynVHD.block_size);
+                uint32_t oi = (uint32_t)(next_voff % g_dynVHD.block_size);
+                uint32_t bat = g_dynVHD.bat[bi];
+                if (bat == 0xFFFFFFFF) break;
+                uint32_t bm = (g_dynVHD.block_size/512+7)/8; bm=(bm+511)/512; if(bm==0) bm=1;
+                next_poff = (uint64_t)bat*512 + (uint64_t)bm*512 + oi;
+            } else {
+                next_poff = next_voff;
+            }
+
+            if (next_poff == start_poff + (run_cnt * 512)) {
+                run_cnt++;
+            } else {
+                break;
+            }
+        }
+
+        LARGE_INTEGER li; li.QuadPart = start_poff;
+        SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN);
+        DWORD br;
+        ReadFile(vhd->hFile, out + i*512, run_cnt * 512, &br, NULL);
+
+        i += run_cnt;
     }
     return EOK;
 }
 
 int VHDManager::BlockWrite(struct ext4_blockdev* bdev, const void* buf, uint64_t blk_id, uint32_t blk_cnt) {
     VHDBlockDevice* vhd = (VHDBlockDevice*)bdev->bdif->p_user; const uint8_t* in = (const uint8_t*)buf;
-    for (uint32_t i = 0; i < blk_cnt; i++) {
-        uint64_t voff = vhd->partition_offset + ((blk_id + i) * 512); uint64_t poff;
+    uint32_t i = 0;
+    while (i < blk_cnt) {
+        uint64_t start_voff = vhd->partition_offset + ((blk_id + i) * 512);
+        uint64_t start_poff;
         if (g_dynVDI.is_vdi) {
-            uint32_t bi = (uint32_t)(voff / g_dynVDI.block_size);
-            uint32_t oi = (uint32_t)(voff % g_dynVDI.block_size);
+            uint32_t bi = (uint32_t)(start_voff / g_dynVDI.block_size);
+            uint32_t oi = (uint32_t)(start_voff % g_dynVDI.block_size);
             if (bi >= g_dynVDI.blocks_in_image) return EIO;
             if (g_dynVDI.bat[bi] == 0xFFFFFFFF) {
-                // Allocate a new block for VDI: assign next sequential block index
-                // Find max allocated block to place new one after it
                 uint32_t max_blk = 0;
                 for (uint32_t j = 0; j < g_dynVDI.blocks_in_image; j++)
                     if (g_dynVDI.bat[j] != 0xFFFFFFFF && g_dynVDI.bat[j] > max_blk) max_blk = g_dynVDI.bat[j];
                 uint32_t new_blk = max_blk + 1;
                 g_dynVDI.bat[bi] = new_blk;
-                // Write updated BAT entry back to file
                 LARGE_INTEGER bpos; bpos.QuadPart = (uint64_t)g_dynVDI.bat_offset + (uint64_t)bi * 4;
                 SetFilePointerEx(vhd->hFile, bpos, NULL, FILE_BEGIN);
                 DWORD bw3; WriteFile(vhd->hFile, &g_dynVDI.bat[bi], 4, &bw3, NULL);
-                // Zero-fill the new block
                 std::vector<uint8_t> zeros(g_dynVDI.block_size, 0);
                 LARGE_INTEGER dpos; dpos.QuadPart = (uint64_t)g_dynVDI.data_offset + (uint64_t)new_blk * g_dynVDI.block_size;
                 SetFilePointerEx(vhd->hFile, dpos, NULL, FILE_BEGIN);
                 DWORD bw2; WriteFile(vhd->hFile, zeros.data(), g_dynVDI.block_size, &bw2, NULL);
             }
-            poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
+            start_poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
         } else if (g_dynVHD.is_dynamic) {
-            uint32_t bi = (uint32_t)(voff / g_dynVHD.block_size); uint32_t oi = (uint32_t)(voff % g_dynVHD.block_size);
+            uint32_t bi = (uint32_t)(start_voff / g_dynVHD.block_size);
+            uint32_t oi = (uint32_t)(start_voff % g_dynVHD.block_size);
             if (g_dynVHD.bat[bi] == 0xFFFFFFFF && !AllocateDynamicBlock(vhd->hFile, bi)) return EIO;
             uint32_t bm = (g_dynVHD.block_size/512+7)/8; bm=(bm+511)/512; if(bm==0) bm=1;
-            poff = (uint64_t)g_dynVHD.bat[bi]*512 + (uint64_t)bm*512 + oi;
-        } else poff = voff;
-        LARGE_INTEGER li; li.QuadPart = poff; SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN);
-        DWORD bw; WriteFile(vhd->hFile, in + i*512, 512, &bw, NULL);
+            start_poff = (uint64_t)g_dynVHD.bat[bi]*512 + (uint64_t)bm*512 + oi;
+        } else {
+            start_poff = start_voff;
+        }
+
+        // Count contiguous sectors
+        uint32_t run_cnt = 1;
+        while (i + run_cnt < blk_cnt) {
+            uint64_t next_voff = vhd->partition_offset + ((blk_id + i + run_cnt) * 512);
+            uint64_t next_poff;
+            if (g_dynVDI.is_vdi) {
+                uint32_t bi = (uint32_t)(next_voff / g_dynVDI.block_size);
+                uint32_t oi = (uint32_t)(next_voff % g_dynVDI.block_size);
+                if (bi >= g_dynVDI.blocks_in_image || g_dynVDI.bat[bi] == 0xFFFFFFFF) break;
+                next_poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
+            } else if (g_dynVHD.is_dynamic) {
+                uint32_t bi = (uint32_t)(next_voff / g_dynVHD.block_size);
+                uint32_t oi = (uint32_t)(next_voff % g_dynVHD.block_size);
+                uint32_t bat = g_dynVHD.bat[bi];
+                if (bat == 0xFFFFFFFF) break;
+                uint32_t bm = (g_dynVHD.block_size/512+7)/8; bm=(bm+511)/512; if(bm==0) bm=1;
+                next_poff = (uint64_t)bat*512 + (uint64_t)bm*512 + oi;
+            } else {
+                next_poff = next_voff;
+            }
+
+            if (next_poff == start_poff + (run_cnt * 512)) {
+                run_cnt++;
+            } else {
+                break;
+            }
+        }
+
+        LARGE_INTEGER li; li.QuadPart = start_poff;
+        SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN);
+        DWORD bw;
+        WriteFile(vhd->hFile, in + i*512, run_cnt * 512, &bw, NULL);
+
+        i += run_cnt;
     }
-    FlushFileBuffers(vhd->hFile); return EOK;
+    FlushFileBuffers(vhd->hFile);
+    return EOK;
 }
 
 bool VHDManager::MountExt4Partition(int idx) {
@@ -404,24 +486,39 @@ void VHDManager::UnmountExt4() {
 
 bool VHDManager::FileExists(const std::string& p) { ext4_file f; if (ext4_fopen(&f, p.c_str(), "rb") == EOK) { ext4_fclose(&f); return true; } return false; }
 
-bool VHDManager::CopyFileFromHost(const std::string& h, const std::string& e) {
+bool VHDManager::CopyFileFromHost(const std::string& h, const std::string& e, ProgressCallback cb) {
     FILE* hf = fopen(h.c_str(), "rb"); if (!hf) return false;
     ext4_file ef; if (ext4_fopen(&ef, e.c_str(), "wb") != EOK) { fclose(hf); return false; }
-    char b[8192]; size_t br, bw; while ((br = fread(b, 1, 8192, hf)) > 0) ext4_fwrite(&ef, b, br, &bw);
+    const size_t buf_size = 256 * 1024;
+    std::vector<char> b(buf_size);
+    size_t br, bw;
+    while ((br = fread(b.data(), 1, buf_size, hf)) > 0) {
+        ext4_fwrite(&ef, b.data(), br, &bw);
+        if (cb) cb(br);
+    }
     fclose(hf); ext4_fclose(&ef); return true;
 }
 
-bool VHDManager::CopyFileToHost(const std::string& e, const std::string& h) {
+bool VHDManager::CopyFileToHost(const std::string& e, const std::string& h, ProgressCallback cb) {
     ext4_file ef; if (ext4_fopen(&ef, e.c_str(), "rb") != EOK) return false;
     FILE* hf = fopen(h.c_str(), "wb"); if (!hf) { ext4_fclose(&ef); return false; }
-    char b[8192]; size_t br; while (ext4_fread(&ef, b, 8192, &br) == EOK && br > 0) fwrite(b, 1, br, hf);
+    const size_t buf_size = 256 * 1024;
+    std::vector<char> b(buf_size);
+    size_t br;
+    while (ext4_fread(&ef, b.data(), buf_size, &br) == EOK && br > 0) {
+        fwrite(b.data(), 1, br, hf);
+        if (cb) cb(br);
+    }
     fclose(hf); ext4_fclose(&ef); return true;
 }
 
 bool VHDManager::CopyInternal(const std::string& s, const std::string& d) {
     ext4_file sf, df; if (ext4_fopen(&sf, s.c_str(), "rb") != EOK) return false;
     if (ext4_fopen(&df, d.c_str(), "wb") != EOK) { ext4_fclose(&sf); return false; }
-    char b[8192]; size_t br, bw; while (ext4_fread(&sf, b, 8192, &br) == EOK && br > 0) ext4_fwrite(&df, b, br, &bw);
+    const size_t buf_size = 256 * 1024;
+    std::vector<char> b(buf_size);
+    size_t br, bw;
+    while (ext4_fread(&sf, b.data(), buf_size, &br) == EOK && br > 0) ext4_fwrite(&df, b.data(), br, &bw);
     ext4_fclose(&sf); ext4_fclose(&df); return true;
 }
 
@@ -430,25 +527,25 @@ bool VHDManager::DeleteRecursive(const std::string& p) {
     return ext4_fremove(p.c_str()) == EOK;
 }
 
-bool VHDManager::ExportRecursive(const std::string& e, const std::string& h) {
+bool VHDManager::ExportRecursive(const std::string& e, const std::string& h, ProgressCallback cb) {
     std::vector<FileInfo> entries;
     if (ListDirectoryInfo(e, entries)) {
         if (!CreateDirectoryA(h.c_str(), NULL) && ::GetLastError() != ERROR_ALREADY_EXISTS) return false;
         for (const auto& entry : entries) {
             std::string sub_e = e + (e.back() == '/' ? "" : "/") + entry.name;
             std::string sub_h = h + "\\" + entry.name;
-            if (entry.is_dir) { if (!ExportRecursive(sub_e, sub_h)) return false; }
-            else { if (!CopyFileToHost(sub_e, sub_h)) return false; }
+            if (entry.is_dir) { if (!ExportRecursive(sub_e, sub_h, cb)) return false; }
+            else { if (!CopyFileToHost(sub_e, sub_h, cb)) return false; }
         }
         return true;
     }
-    return CopyFileToHost(e, h);
+    return CopyFileToHost(e, h, cb);
 }
 
-bool VHDManager::ImportRecursive(const std::string& h, const std::string& e) {
+bool VHDManager::ImportRecursive(const std::string& h, const std::string& e, ProgressCallback cb) {
     DWORD attr = GetFileAttributesA(h.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) return false;
-    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return CopyFileFromHost(h, e);
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return CopyFileFromHost(h, e, cb);
     
     MakeDirectory(e);
     WIN32_FIND_DATAA fd;
@@ -460,11 +557,69 @@ bool VHDManager::ImportRecursive(const std::string& h, const std::string& e) {
         if (n == "." || n == "..") continue;
         std::string sub_h = h + "\\" + n;
         std::string sub_e = e + (e.back() == '/' ? "" : "/") + n;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ImportRecursive(sub_h, sub_e);
-        else CopyFileFromHost(sub_h, sub_e);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ImportRecursive(sub_h, sub_e, cb);
+        else CopyFileFromHost(sub_h, sub_e, cb);
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
     return true;
+}
+
+uint64_t VHDManager::GetExt4SizeRecursive(const std::string& path) {
+    std::vector<FileInfo> entries;
+    uint64_t total_size = 0;
+    if (ListDirectoryInfo(path, entries)) {
+        for (const auto& entry : entries) {
+            std::string sub = path + (path.back() == '/' ? "" : "/") + entry.name;
+            if (entry.is_dir) {
+                total_size += GetExt4SizeRecursive(sub);
+            } else {
+                total_size += entry.size;
+            }
+        }
+    } else {
+        ext4_file f;
+        if (ext4_fopen(&f, path.c_str(), "rb") == EOK) {
+            total_size += ext4_fsize(&f);
+            ext4_fclose(&f);
+        }
+    }
+    return total_size;
+}
+
+uint64_t VHDManager::GetHostSizeRecursive(const std::string& path) {
+    DWORD attr = GetFileAttributesA(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return 0;
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER li;
+            GetFileSizeEx(hFile, &li);
+            CloseHandle(hFile);
+            return li.QuadPart;
+        }
+        return 0;
+    }
+    
+    uint64_t total_size = 0;
+    WIN32_FIND_DATAA fd;
+    std::string search = path + "\\*";
+    HANDLE hFind = FindFirstFileA(search.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
+    do {
+        std::string n = fd.cFileName;
+        if (n == "." || n == "..") continue;
+        std::string sub = path + "\\" + n;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            total_size += GetHostSizeRecursive(sub);
+        } else {
+            LARGE_INTEGER li;
+            li.LowPart = fd.nFileSizeLow;
+            li.HighPart = fd.nFileSizeHigh;
+            total_size += li.QuadPart;
+        }
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+    return total_size;
 }
 
 bool VHDManager::Rename(const std::string& o, const std::string& n) { return ext4_frename(o.c_str(), n.c_str()) == EOK; }

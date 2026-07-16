@@ -20,6 +20,9 @@
 #include <d3d11.h>
 #include <tchar.h>
 #include <string>
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include <vector>
 #include <algorithm>
 #include <commdlg.h>
@@ -105,7 +108,7 @@ struct ExplorerApp {
     VHDManager vhd;
     std::string current_path = "/";
     std::vector<FileInfo> files;
-    bool needs_refresh = false;
+    std::atomic<bool> needs_refresh{false};
     std::string error_msg;
 
     // Selection
@@ -131,6 +134,27 @@ struct ExplorerApp {
     char perm_mode[16];
     char perm_uid[16];
     char perm_gid[16];
+
+    // Background operations
+    std::atomic<bool> operation_running{false};
+    std::atomic<uint64_t> operation_total_bytes{0};
+    std::atomic<uint64_t> operation_current_bytes{0};
+    std::string operation_title;
+    std::string operation_status;
+    std::mutex state_mutex;
+
+    void SetOperationStatus(const std::string& title, const std::string& status, uint64_t total_bytes = 0) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        operation_title = title;
+        operation_status = status;
+        operation_total_bytes = total_bytes;
+        operation_current_bytes = 0;
+    }
+
+    std::pair<std::string, std::string> GetOperationStatus() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        return {operation_title, operation_status};
+    }
 
     void OpenAndMountImage(const std::string& path) {
         if (vhd.OpenVHD(path)) {
@@ -168,6 +192,7 @@ struct ExplorerApp {
     }
 
     void HandleDroppedFiles(const std::vector<std::string>& paths) {
+        if (operation_running) return;
         if (paths.empty()) return;
 
         bool is_single_vhd = false;
@@ -212,6 +237,12 @@ struct ExplorerApp {
         }
 
         // If we get here, it means we are mounted, and the dropped items are files/folders to be imported
+        struct ImportItem {
+            std::string path;
+            std::string dest;
+            bool is_dir;
+        };
+        std::vector<ImportItem> items_to_import;
         for (const auto& path : paths) {
             DWORD dwAttrs = GetFileAttributesA(path.c_str());
             if (dwAttrs == INVALID_FILE_ATTRIBUTES) continue;
@@ -221,17 +252,47 @@ struct ExplorerApp {
             std::string dest = GetFullPath(name);
 
             bool is_dir = (dwAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            if (is_dir) {
-                if (!vhd.ImportRecursive(path, dest)) {
-                    error_msg = "Failed to import folder: " + vhd.GetLastError();
-                }
-            } else {
-                if (!vhd.CopyFileFromHost(path, dest)) {
-                    error_msg = "Failed to import file: " + vhd.GetLastError();
+            items_to_import.push_back({path, dest, is_dir});
+        }
+
+        if (items_to_import.empty()) return;
+
+        uint64_t total_size = 0;
+        for (const auto& item : items_to_import) {
+            total_size += vhd.GetHostSizeRecursive(item.path);
+        }
+
+        SetOperationStatus("Importing Dropped Items", "Copying dropped items...", total_size);
+        operation_running = true;
+
+        std::thread([this, items_to_import]() {
+            bool success = true;
+            std::string last_error;
+            auto progress_cb = [this](uint64_t increment) {
+                operation_current_bytes += increment;
+            };
+            for (const auto& item : items_to_import) {
+                if (item.is_dir) {
+                    if (!vhd.ImportRecursive(item.path, item.dest, progress_cb)) {
+                        success = false;
+                        last_error = "Failed to import folder '" + item.path + "': " + vhd.GetLastError();
+                        break;
+                    }
+                } else {
+                    if (!vhd.CopyFileFromHost(item.path, item.dest, progress_cb)) {
+                        success = false;
+                        last_error = "Failed to import file '" + item.path + "': " + vhd.GetLastError();
+                        break;
+                    }
                 }
             }
-        }
-        needs_refresh = true;
+            std::lock_guard<std::mutex> lock(state_mutex);
+            if (!success) {
+                error_msg = last_error;
+            }
+            needs_refresh = true;
+            operation_running = false;
+        }).detach();
     }
 
     void Refresh() {
@@ -351,12 +412,22 @@ struct ExplorerApp {
                 if (!h.empty()) {
                     size_t s = h.find_last_of("\\/");
                     std::string n = (s == std::string::npos) ? h : h.substr(s + 1);
-                    error_msg = "";
-                    if (vhd.CopyFileFromHost(h, GetFullPath(n))) {
+                    std::string dest = GetFullPath(n);
+                    uint64_t total_size = vhd.GetHostSizeRecursive(h);
+                    SetOperationStatus("Importing File", "Copying " + n + " from host...", total_size);
+                    operation_running = true;
+                    std::thread([this, h, dest, n]() {
+                        auto progress_cb = [this](uint64_t increment) {
+                            operation_current_bytes += increment;
+                        };
+                        bool success = vhd.CopyFileFromHost(h, dest, progress_cb);
+                        std::lock_guard<std::mutex> lock(state_mutex);
+                        if (!success) {
+                            error_msg = "Failed to import file '" + n + "': " + vhd.GetLastError();
+                        }
                         needs_refresh = true;
-                    } else {
-                        error_msg = "Failed to import file: " + vhd.GetLastError();
-                    }
+                        operation_running = false;
+                    }).detach();
                 }
             }
             if (ImGui::MenuItem("Folder...")) {
@@ -365,12 +436,22 @@ struct ExplorerApp {
                     size_t s = h.find_last_of("\\/");
                     if (s == h.length() - 1) s = h.find_last_of("\\/", s - 1);
                     std::string n = (s == std::string::npos) ? h : h.substr(s + 1);
-                    error_msg = "";
-                    if (vhd.ImportRecursive(h, GetFullPath(n))) {
+                    std::string dest = GetFullPath(n);
+                    uint64_t total_size = vhd.GetHostSizeRecursive(h);
+                    SetOperationStatus("Importing Folder", "Copying " + n + " from host...", total_size);
+                    operation_running = true;
+                    std::thread([this, h, dest, n]() {
+                        auto progress_cb = [this](uint64_t increment) {
+                            operation_current_bytes += increment;
+                        };
+                        bool success = vhd.ImportRecursive(h, dest, progress_cb);
+                        std::lock_guard<std::mutex> lock(state_mutex);
+                        if (!success) {
+                            error_msg = "Failed to import folder '" + n + "': " + vhd.GetLastError();
+                        }
                         needs_refresh = true;
-                    } else {
-                        error_msg = "Failed to import folder: " + vhd.GetLastError();
-                    }
+                        operation_running = false;
+                    }).detach();
                 }
             }
             ImGui::EndPopup();
@@ -382,15 +463,75 @@ struct ExplorerApp {
                 bool is_dir = false; for(auto& f:files) if(f.name == name) { is_dir = f.is_dir; break; }
                 if (is_dir) {
                     std::string folder = PickFolder();
-                    if (!folder.empty()) vhd.ExportRecursive(GetFullPath(name), folder + "\\" + name);
+                    if (!folder.empty()) {
+                        std::string src = GetFullPath(name);
+                        std::string dest = folder + "\\" + name;
+                        uint64_t total_size = vhd.GetExt4SizeRecursive(src);
+                        SetOperationStatus("Exporting Directory", "Copying " + name + " to host...", total_size);
+                        operation_running = true;
+                        std::thread([this, src, dest, name]() {
+                            auto progress_cb = [this](uint64_t increment) {
+                                operation_current_bytes += increment;
+                            };
+                            bool success = vhd.ExportRecursive(src, dest, progress_cb);
+                            std::lock_guard<std::mutex> lock(state_mutex);
+                            if (!success) {
+                                error_msg = "Failed to export directory '" + name + "': " + vhd.GetLastError();
+                            }
+                            operation_running = false;
+                        }).detach();
+                    }
                 } else {
                     std::string h = SaveFileDialog(name);
-                    if (!h.empty()) vhd.CopyFileToHost(GetFullPath(name), h);
+                    if (!h.empty()) {
+                        std::string src = GetFullPath(name);
+                        uint64_t total_size = vhd.GetExt4SizeRecursive(src);
+                        SetOperationStatus("Exporting File", "Copying " + name + " to host...", total_size);
+                        operation_running = true;
+                        std::thread([this, src, h, name]() {
+                            auto progress_cb = [this](uint64_t increment) {
+                                operation_current_bytes += increment;
+                            };
+                            bool success = vhd.CopyFileToHost(src, h, progress_cb);
+                            std::lock_guard<std::mutex> lock(state_mutex);
+                            if (!success) {
+                                error_msg = "Failed to export file '" + name + "': " + vhd.GetLastError();
+                            }
+                            operation_running = false;
+                        }).detach();
+                    }
                 }
             } else {
                 std::string folder = PickFolder();
                 if (!folder.empty()) {
-                    for (auto& name : selected_items) vhd.ExportRecursive(GetFullPath(name), folder + "\\" + name);
+                    std::vector<std::pair<std::string, std::string>> items;
+                    uint64_t total_size = 0;
+                    for (auto& name : selected_items) {
+                        std::string src = GetFullPath(name);
+                        total_size += vhd.GetExt4SizeRecursive(src);
+                        items.push_back({src, folder + "\\" + name});
+                    }
+                    SetOperationStatus("Exporting Multiple Items", "Copying items to host...", total_size);
+                    operation_running = true;
+                    std::thread([this, items]() {
+                        bool success = true;
+                        std::string last_error;
+                        auto progress_cb = [this](uint64_t increment) {
+                            operation_current_bytes += increment;
+                        };
+                        for (const auto& item : items) {
+                            if (!vhd.ExportRecursive(item.first, item.second, progress_cb)) {
+                                success = false;
+                                last_error = vhd.GetLastError();
+                                break;
+                            }
+                        }
+                        std::lock_guard<std::mutex> lock(state_mutex);
+                        if (!success) {
+                            error_msg = "Failed to export: " + last_error;
+                        }
+                        operation_running = false;
+                    }).detach();
                 }
             }
         } ImGui::SameLine();
@@ -637,6 +778,34 @@ struct ExplorerApp {
                 needs_refresh=true; ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        if (operation_running) {
+            ImGui::OpenPopup("Background Operation");
+        }
+        if (ImGui::BeginPopupModal("Background Operation", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+            auto status = GetOperationStatus();
+            ImGui::Text("%s", status.first.c_str());
+            ImGui::Separator();
+            ImGui::Text("%s", status.second.c_str());
+            
+            uint64_t total = operation_total_bytes.load();
+            uint64_t current = operation_current_bytes.load();
+            if (total > 0) {
+                float fraction = (float)current / (float)total;
+                if (fraction > 1.0f) fraction = 1.0f;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%.1f MB / %.1f MB (%.0f%%)", current / (1024.0f * 1024.0f), total / (1024.0f * 1024.0f), fraction * 100.0f);
+                ImGui::ProgressBar(fraction, ImVec2(300, 0), buf);
+            } else {
+                ImGui::Text("Calculating / Processing...");
+            }
+            
+            ImGui::Spacing();
+            if (!operation_running) {
+                ImGui::CloseCurrentPopup();
+            }
             ImGui::EndPopup();
         }
         ImGui::End();

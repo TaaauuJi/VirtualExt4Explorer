@@ -23,6 +23,9 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <functional>
+
+typedef std::function<void(uint64_t)> ProgressCallback;
 
 
 struct ext4_blockdev;
@@ -76,10 +79,12 @@ public:
     bool FileExists(const std::string& path);
     bool BackupFile(const std::string& source, const std::string& backup);
     bool DeleteRecursive(const std::string& path);
-    bool CopyFileFromHost(const std::string& host_path, const std::string& ext4_path);
-    bool CopyFileToHost(const std::string& ext4_path, const std::string& host_path);
-    bool ExportRecursive(const std::string& ext4_path, const std::string& host_path);
-    bool ImportRecursive(const std::string& host_path, const std::string& ext4_path);
+    bool CopyFileFromHost(const std::string& host_path, const std::string& ext4_path, ProgressCallback cb = nullptr);
+    bool CopyFileToHost(const std::string& ext4_path, const std::string& host_path, ProgressCallback cb = nullptr);
+    bool ExportRecursive(const std::string& ext4_path, const std::string& host_path, ProgressCallback cb = nullptr);
+    bool ImportRecursive(const std::string& host_path, const std::string& ext4_path, ProgressCallback cb = nullptr);
+    uint64_t GetExt4SizeRecursive(const std::string& path);
+    uint64_t GetHostSizeRecursive(const std::string& path);
     bool CopyInternal(const std::string& src_path, const std::string& dst_path);
     bool Rename(const std::string& old_path, const std::string& new_path);
     bool ListDirectoryInfo(const std::string& path, std::vector<FileInfo>& entries);
