@@ -151,6 +151,16 @@ struct ExplorerApp {
         operation_current_bytes = 0;
     }
 
+    void SetErrorMsg(const std::string& msg) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        error_msg = msg;
+    }
+
+    std::string GetErrorMsg() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        return error_msg;
+    }
+
     std::pair<std::string, std::string> GetOperationStatus() {
         std::lock_guard<std::mutex> lock(state_mutex);
         return {operation_title, operation_status};
@@ -180,15 +190,29 @@ struct ExplorerApp {
                 history_back.clear();
                 history_forward.clear();
                 needs_refresh = true;
-                error_msg = "";
+                SetErrorMsg("");
             } else {
-                error_msg = "No mountable ext4 partition found in this image";
+                std::string msg = "No mountable ext4 partition found in this image";
                 if (!vhd.GetLastError().empty())
-                    error_msg += " (" + vhd.GetLastError() + ")";
+                    msg += " (" + vhd.GetLastError() + ")";
+                SetErrorMsg(msg);
             }
         } else {
-            error_msg = vhd.GetLastError();
+            SetErrorMsg(vhd.GetLastError());
         }
+    }
+
+    void UnmountAndCloseImage() {
+        if (operation_running) return;
+        vhd.CloseVHD();
+        files.clear();
+        selected_items.clear();
+        last_clicked_index = -1;
+        current_path = "";
+        history_back.clear();
+        history_forward.clear();
+        SetErrorMsg("");
+        needs_refresh = false;
     }
 
     void HandleDroppedFiles(const std::vector<std::string>& paths) {
@@ -231,7 +255,7 @@ struct ExplorerApp {
             }
 
             if (!vhd.IsExt4Mounted()) {
-                error_msg = "Please mount a VHD image first to import files/folders, or drop a VHD file to mount it.";
+                SetErrorMsg("Please mount a VHD image first to import files/folders, or drop a VHD file to mount it.");
                 return;
             }
         }
@@ -299,12 +323,14 @@ struct ExplorerApp {
         if (vhd.IsExt4Mounted()) {
             files.clear();
             if (!vhd.ListDirectoryInfo(current_path, files)) {
-                error_msg = vhd.GetLastError();
+                SetErrorMsg(vhd.GetLastError());
             } else {
-                if (error_msg.find("Failed to") == std::string::npos && 
-                    error_msg.find("Please mount") == std::string::npos && 
-                    error_msg.find("No ext4 partition") == std::string::npos) {
-                    error_msg = "";
+                std::string cur = GetErrorMsg();
+                if (cur.find("Failed to") == std::string::npos &&
+                    cur.find("Please mount") == std::string::npos &&
+                    cur.find("No ext4 partition") == std::string::npos &&
+                    cur.find("No mountable") == std::string::npos) {
+                    SetErrorMsg("");
                 }
                 std::sort(files.begin(), files.end(), [](const FileInfo& a, const FileInfo& b) {
                     if (a.is_dir != b.is_dir) return a.is_dir;
@@ -331,11 +357,11 @@ struct ExplorerApp {
         }
         current_path = target;
         needs_refresh = true;
-        error_msg = "";
+        SetErrorMsg("");
     }
 
-    void GoBack() { if (!history_back.empty()) { history_forward.push_back(current_path); current_path = history_back.back(); history_back.pop_back(); needs_refresh = true; error_msg = ""; } }
-    void GoForward() { if (!history_forward.empty()) { history_back.push_back(current_path); current_path = history_forward.back(); history_forward.pop_back(); needs_refresh = true; error_msg = ""; } }
+    void GoBack() { if (!history_back.empty()) { history_forward.push_back(current_path); current_path = history_back.back(); history_back.pop_back(); needs_refresh = true; SetErrorMsg(""); } }
+    void GoForward() { if (!history_forward.empty()) { history_back.push_back(current_path); current_path = history_forward.back(); history_forward.pop_back(); needs_refresh = true; SetErrorMsg(""); } }
 
     std::string GetFullPath(const std::string& name) {
         std::string p = current_path;
@@ -343,18 +369,43 @@ struct ExplorerApp {
         return p + name;
     }
 
+    std::string MakeUniqueDest(const std::string& dest) {
+        if (!vhd.FileExists(dest)) return dest;
+        size_t slash = dest.find_last_of('/');
+        std::string dir = (slash == std::string::npos) ? "" : dest.substr(0, slash + 1);
+        std::string base = (slash == std::string::npos) ? dest : dest.substr(slash + 1);
+        size_t dot = base.find_last_of('.');
+        std::string stem = base, ext = "";
+        // Keep leading-dot files (".bashrc") intact: only split if dot > 0.
+        if (dot != std::string::npos && dot != 0) { stem = base.substr(0, dot); ext = base.substr(dot); }
+        for (int i = 1; i < 1000; i++) {
+            std::string cand = dir + stem + " - Copy" + (i > 1 ? " (" + std::to_string(i) + ")" : "") + ext;
+            if (!vhd.FileExists(cand)) return cand;
+        }
+        return dest; // give up: let CopyInternal report the collision
+    }
+
     void DoPaste() {
+        if (operation_running) { SetErrorMsg("Please wait for the current operation to finish."); return; }
+        SetErrorMsg("");
         for (const auto& item : clipboard) {
             size_t last_slash = item.path.find_last_of('/');
             std::string name = (last_slash == std::string::npos) ? item.path : item.path.substr(last_slash + 1);
             std::string dest = GetFullPath(name);
+            bool ok = false;
             if (item.is_cut) {
-                vhd.Rename(item.path, dest);
+                if (item.path == dest) continue; // moving onto itself: no-op
+                ok = vhd.Rename(item.path, dest);
             } else {
-                vhd.CopyInternal(item.path, dest);
+                if (item.path == dest) dest = MakeUniqueDest(dest);
+                ok = vhd.CopyInternal(item.path, dest);
+            }
+            if (!ok) {
+                SetErrorMsg(std::string(item.is_cut ? "Failed to move '" : "Failed to copy '") + item.path + "': " + vhd.GetLastError());
+                break;
             }
         }
-        if (!clipboard.empty() && clipboard[0].is_cut) clipboard.clear();
+        if (!clipboard.empty() && clipboard[0].is_cut && GetErrorMsg().empty()) clipboard.clear();
         needs_refresh = true;
     }
 
@@ -379,19 +430,33 @@ struct ExplorerApp {
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("Mount")) {
                 if (ImGui::MenuItem("Open Image...")) {
-                    std::string p = OpenFileDialog();
-                    if (!p.empty()) {
-                        OpenAndMountImage(p);
+                    if (operation_running) {
+                        SetErrorMsg("Please wait for the current operation to finish before opening another image.");
+                    } else {
+                        std::string p = OpenFileDialog();
+                        if (!p.empty()) {
+                            OpenAndMountImage(p);
+                        }
                     }
                 }
-                if (ImGui::BeginMenu("Partitions", vhd.IsOpen())) {
-                    for (int i=0; i<(int)vhd.GetPartitions().size(); i++) {
-                        char l[64]; snprintf(l,64,"Part %d (%s)", i, vhd.GetPartitions()[i].is_ext4?"ext4":"other");
-                        if (ImGui::MenuItem(l,NULL,false,vhd.GetPartitions()[i].is_ext4)) { vhd.MountExt4Partition(i); current_path="/"; needs_refresh=true; error_msg = ""; }
+                if (ImGui::BeginMenu("Partitions", vhd.IsOpen() && !operation_running)) {
+                    std::vector<PartitionInfo> parts = vhd.GetPartitions();
+                    int cur_part = vhd.GetMountedPartitionIndex();
+                    for (int i=0; i<(int)parts.size(); i++) {
+                        char l[64]; snprintf(l,64,"Part %d (%s)", i, parts[i].is_ext4?"ext4":"other");
+                        bool is_mounted = (i == cur_part && vhd.IsExt4Mounted());
+                        if (ImGui::MenuItem(l, NULL, is_mounted, parts[i].is_ext4)) {
+                            vhd.MountExt4Partition(i);
+                            current_path = "/";
+                            needs_refresh = true;
+                            SetErrorMsg("");
+                        }
                     }
                     ImGui::EndMenu();
                 }
-                if (ImGui::MenuItem("Unmount", NULL, false, vhd.IsExt4Mounted())) { vhd.UnmountExt4(); files.clear(); error_msg = ""; }
+                if (ImGui::MenuItem("Unmount", NULL, false, vhd.IsOpen() && !operation_running)) {
+                    UnmountAndCloseImage();
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit")) PostQuitMessage(0);
                 ImGui::EndMenu();
@@ -400,6 +465,8 @@ struct ExplorerApp {
         }
 
         // Toolbar
+        bool toolbar_disabled = operation_running || !vhd.IsExt4Mounted();
+        ImGui::BeginDisabled(toolbar_disabled);
         if (ImGui::Button("<")) GoBack(); ImGui::SameLine();
         if (ImGui::Button(">")) GoForward(); ImGui::SameLine();
         if (ImGui::Button("Up")) Navigate(".."); ImGui::SameLine();
@@ -544,13 +611,16 @@ struct ExplorerApp {
             if (ImGui::MenuItem("Refresh")) needs_refresh = true;
             ImGui::EndPopup();
         }
+        ImGui::EndDisabled();
 
         ImGui::PushItemWidth(-1);
         if (ImGui::InputText("##Path", &current_path, ImGuiInputTextFlags_EnterReturnsTrue)) needs_refresh = true;
         ImGui::PopItemWidth();
 
-        if (!error_msg.empty()) ImGui::TextColored(ImVec4(1,0,0,1), "Error: %s", error_msg.c_str());
         if (needs_refresh) Refresh();
+
+        { std::string err = GetErrorMsg();
+          if (!err.empty()) ImGui::TextColored(ImVec4(1,0,0,1), "Error: %s", err.c_str()); }
 
         if (ImGui::BeginTable("Files", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg)) {
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
@@ -689,10 +759,10 @@ struct ExplorerApp {
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.05f, 0.1f, 1.0f));
                 if (ImGui::Button("Delete permanently", ImVec2(160, 0))) {
-                    error_msg = "";
+                    SetErrorMsg("");
                     for (auto& s : selected_items) {
                         if (!vhd.DeleteRecursive(GetFullPath(s))) {
-                            error_msg = "Failed to delete: " + vhd.GetLastError();
+                            SetErrorMsg("Failed to delete: " + vhd.GetLastError());
                         }
                     }
                     needs_refresh = true;
@@ -728,14 +798,14 @@ struct ExplorerApp {
             ImGui::Spacing();
             
             if (ImGui::Button("OK", ImVec2(120,0))) {
-                error_msg = "";
+                SetErrorMsg("");
                 if (rename_old.empty()) {
                     if (!vhd.MakeDirectory(GetFullPath(rename_new))) {
-                        error_msg = "Failed to create directory: " + vhd.GetLastError();
+                        SetErrorMsg("Failed to create directory: " + vhd.GetLastError());
                     }
                 } else {
                     if (!vhd.Rename(GetFullPath(rename_old), GetFullPath(rename_new))) {
-                        error_msg = "Failed to rename: " + vhd.GetLastError();
+                        SetErrorMsg("Failed to rename: " + vhd.GetLastError());
                     }
                 }
                 needs_refresh=true; ImGui::CloseCurrentPopup();
@@ -764,16 +834,19 @@ struct ExplorerApp {
             ImGui::Spacing();
             
             if (ImGui::Button("Create", ImVec2(120,0))) {
-                error_msg = "";
-                HANDLE h = CreateFileA("temp_empty", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                SetErrorMsg("");
+                char tmpPath[MAX_PATH] = {0}, tmpFile[MAX_PATH] = {0};
+                bool tmp_ok = GetTempPathA(MAX_PATH, tmpPath) != 0 &&
+                              GetTempFileNameA(tmpPath, "vhd", 0, tmpFile) != 0;
+                HANDLE h = tmp_ok ? CreateFileA(tmpFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL) : INVALID_HANDLE_VALUE;
                 if (h != INVALID_HANDLE_VALUE) {
-                    CloseHandle(h);
-                    if (!vhd.CopyFileFromHost("temp_empty", GetFullPath(rename_new))) {
-                        error_msg = "Failed to create file: " + vhd.GetLastError();
+                    CloseHandle(h); // zero-byte temp; DELETE_ON_CLOSE removes it
+                    if (!vhd.CopyFileFromHost(tmpFile, GetFullPath(rename_new))) {
+                        SetErrorMsg("Failed to create file: " + vhd.GetLastError());
                     }
-                    DeleteFileA("temp_empty");
                 } else {
-                    error_msg = "Failed to create local temporary file.";
+                    SetErrorMsg("Failed to create local temporary file.");
+                    if (tmp_ok) DeleteFileA(tmpFile);
                 }
                 needs_refresh=true; ImGui::CloseCurrentPopup();
             }

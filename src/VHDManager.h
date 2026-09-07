@@ -24,6 +24,7 @@
 #include <vector>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 
 typedef std::function<void(uint64_t)> ProgressCallback;
 
@@ -64,20 +65,20 @@ public:
 
     bool OpenVHD(const std::string& path);
     void CloseVHD();
-    bool IsOpen() const { return m_hVHD != INVALID_HANDLE_VALUE; }
-    std::string GetVHDPath() const { return m_vhd_path; }
+    bool IsOpen() const { std::lock_guard<std::recursive_mutex> lock(m_mutex); return m_hVHD != INVALID_HANDLE_VALUE; }
+    std::string GetVHDPath() const { std::lock_guard<std::recursive_mutex> lock(m_mutex); return m_vhd_path; }
 
 
-    const std::vector<PartitionInfo>& GetPartitions() const { return m_partitions; }
+    std::vector<PartitionInfo> GetPartitions() const { std::lock_guard<std::recursive_mutex> lock(m_mutex); return m_partitions; }
 
 
     bool MountExt4Partition(int partition_index);
     void UnmountExt4();
-    bool IsExt4Mounted() const { return m_ext4_mounted; }
+    bool IsExt4Mounted() const { std::lock_guard<std::recursive_mutex> lock(m_mutex); return m_ext4_mounted; }
+    int GetMountedPartitionIndex() const { std::lock_guard<std::recursive_mutex> lock(m_mutex); return m_mounted_partition_index; }
 
 
     bool FileExists(const std::string& path);
-    bool BackupFile(const std::string& source, const std::string& backup);
     bool DeleteRecursive(const std::string& path);
     bool CopyFileFromHost(const std::string& host_path, const std::string& ext4_path, ProgressCallback cb = nullptr);
     bool CopyFileToHost(const std::string& ext4_path, const std::string& host_path, ProgressCallback cb = nullptr);
@@ -95,7 +96,11 @@ public:
     bool MakeDirectory(const std::string& path);
 
 
-    std::string GetLastError() const { return m_last_error; }
+    std::string GetLastError() const { std::lock_guard<std::recursive_mutex> lock(m_mutex); return m_last_error; }
+    // Flush ext4 block cache + host file buffers so a copied file
+    // survives remount / reopen. Must be called with m_mutex held
+    // (or from a context that already holds it).
+    bool FlushNoLock();
 
 private:
 
@@ -128,6 +133,15 @@ private:
 
     HANDLE m_virtDiskHandle;
     bool m_isVirtDiskAttached;
+
+    // Serializes ALL lwext4 access. lwext4 has no internal OS locks
+    // (os_locks == nullptr in this port), and BlockRead/BlockWrite touch
+    // shared BAT state + a Win32 file handle, so concurrent calls from
+    // the UI thread (Refresh/List) and background import/export threads
+    // corrupt metadata and produce 0-byte / disappearing files.
+    // Recursive because ImportRecursive/ExportRecursive/Set*Recursive
+    // re-enter other locked methods, and Mount calls Unmount.
+    mutable std::recursive_mutex m_mutex;
 };
 
 #endif // VHD_MANAGER_H

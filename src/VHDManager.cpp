@@ -111,19 +111,30 @@ static uint64_t GetDiskSize(HANDLE h) {
 
 static bool AllocateDynamicBlock(HANDLE hFile, uint32_t block_index) {
     if (block_index >= g_dynVHD.max_table_entries) return false;
+    if (g_dynVHD.bat[block_index] != 0xFFFFFFFF) return true; // already allocated
     LARGE_INTEGER fileSize; if (!GetFileSizeEx(hFile, &fileSize)) return false;
-    uint64_t new_block_file_offset = fileSize.QuadPart - 512;
+    if (fileSize.QuadPart < 512) return false;
+    uint64_t new_block_file_offset = (uint64_t)fileSize.QuadPart - 512;
     uint32_t new_bat_sector = (uint32_t)(new_block_file_offset / 512);
     uint32_t bitmap_sectors = (g_dynVHD.block_size / 512 + 7) / 8;
     uint32_t bitmap_padded = (bitmap_sectors + 511) & ~511u; if (bitmap_padded == 0) bitmap_padded = 512;
-    LARGE_INTEGER li; li.QuadPart = new_block_file_offset; if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) return false;
-    { std::vector<uint8_t> bitmap(bitmap_padded, 0xFF); DWORD written; WriteFile(hFile, bitmap.data(), bitmap_padded, &written, NULL); }
-    { std::vector<uint8_t> zeros(65536, 0); uint32_t rem = g_dynVHD.block_size; while(rem>0) { uint32_t tw=(rem<65536)?rem:65536; DWORD wr; WriteFile(hFile, zeros.data(), tw, &wr, NULL); rem-=tw; } }
-    uint8_t footer[512]; li.QuadPart = 0; SetFilePointerEx(hFile, li, NULL, FILE_BEGIN); DWORD br; ReadFile(hFile, footer, 512, &br, NULL);
-    li.QuadPart = new_block_file_offset + bitmap_padded + g_dynVHD.block_size; SetFilePointerEx(hFile, li, NULL, FILE_BEGIN); DWORD bw; WriteFile(hFile, footer, 512, &bw, NULL);
+    LARGE_INTEGER li; li.QuadPart = (LONGLONG)new_block_file_offset; if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) return false;
+    { std::vector<uint8_t> bitmap(bitmap_padded, 0xFF); DWORD written = 0;
+      if (!WriteFile(hFile, bitmap.data(), bitmap_padded, &written, NULL) || written != bitmap_padded) return false; }
+    { std::vector<uint8_t> zeros(65536, 0); uint32_t rem = g_dynVHD.block_size; while(rem>0) { uint32_t tw=(rem<65536)?rem:65536; DWORD wr = 0;
+      if (!WriteFile(hFile, zeros.data(), tw, &wr, NULL) || wr != tw) return false; rem-=tw; } }
+    uint8_t footer[512]; li.QuadPart = 0;
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) return false;
+    DWORD br = 0; if (!ReadFile(hFile, footer, 512, &br, NULL) || br != 512) return false;
+    li.QuadPart = (LONGLONG)(new_block_file_offset + bitmap_padded + g_dynVHD.block_size);
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) return false;
+    DWORD bw = 0; if (!WriteFile(hFile, footer, 512, &bw, NULL) || bw != 512) return false;
     g_dynVHD.bat[block_index] = new_bat_sector;
-    uint32_t be_bat = _byteswap_ulong(new_bat_sector); li.QuadPart = g_dynVHD.table_offset + ((uint64_t)block_index * 4); SetFilePointerEx(hFile, li, NULL, FILE_BEGIN); WriteFile(hFile, &be_bat, 4, &bw, NULL);
-    FlushFileBuffers(hFile); return true;
+    uint32_t be_bat = _byteswap_ulong(new_bat_sector); li.QuadPart = (LONGLONG)(g_dynVHD.table_offset + ((uint64_t)block_index * 4));
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) { g_dynVHD.bat[block_index] = 0xFFFFFFFF; return false; }
+    if (!WriteFile(hFile, &be_bat, 4, &bw, NULL) || bw != 4) { g_dynVHD.bat[block_index] = 0xFFFFFFFF; return false; }
+    if (!FlushFileBuffers(hFile)) return false;
+    return true;
 }
 
 VHDManager::VHDManager() : m_hVHD(INVALID_HANDLE_VALUE), m_ext4_bdev(nullptr), m_bdif(nullptr), m_ext4_mounted(false), m_mounted_partition_index(-1), m_virtDiskHandle(NULL), m_isVirtDiskAttached(false) { memset(&m_block_device, 0, sizeof(m_block_device)); }
@@ -164,6 +175,7 @@ struct DynamicVDIInfo {
 static DynamicVDIInfo g_dynVDI = {};
 
 bool VHDManager::OpenVHD(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     CloseVHD(); m_vhd_path = path;
     std::string ext;
     size_t dot = path.find_last_of('.');
@@ -259,12 +271,20 @@ bool VHDManager::OpenVHD(const std::string& path) {
 }
 
 void VHDManager::CloseVHD() {
-    UnmountExt4();
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // Unmount without re-locking is fine (recursive), call directly.
+    if (m_ext4_mounted) {
+        ext4_cache_flush("/");
+        if (m_hVHD != INVALID_HANDLE_VALUE) FlushFileBuffers(m_hVHD);
+        ext4_umount("/"); ext4_device_unregister("vhd");
+        if (m_bdif) delete[] m_bdif->ph_bbuf; delete m_bdif; delete m_ext4_bdev;
+        m_bdif = nullptr; m_ext4_bdev = nullptr; m_ext4_mounted = false;
+    }
     if (g_dynVHD.bat) delete[] g_dynVHD.bat; g_dynVHD.bat = nullptr; g_dynVHD.is_dynamic = false;
     if (g_dynVDI.bat) delete[] g_dynVDI.bat; g_dynVDI.bat = nullptr; g_dynVDI = {};
     if (m_hVHD != INVALID_HANDLE_VALUE) CloseHandle(m_hVHD); m_hVHD = INVALID_HANDLE_VALUE;
     if (m_isVirtDiskAttached) { DetachVirtualDisk(m_virtDiskHandle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0); CloseHandle(m_virtDiskHandle); }
-    m_isVirtDiskAttached = false; m_partitions.clear(); m_vhd_path.clear();
+    m_isVirtDiskAttached = false; m_partitions.clear(); m_vhd_path.clear(); m_mounted_partition_index = -1;
 }
 
 bool VHDManager::ReadVHDFooter() {
@@ -377,9 +397,9 @@ int VHDManager::BlockRead(struct ext4_blockdev* bdev, void* buf, uint64_t blk_id
         }
 
         LARGE_INTEGER li; li.QuadPart = start_poff;
-        SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN);
-        DWORD br;
-        ReadFile(vhd->hFile, out + i*512, run_cnt * 512, &br, NULL);
+        if (!SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN)) return EIO;
+        DWORD br = 0;
+        if (!ReadFile(vhd->hFile, out + i*512, run_cnt * 512, &br, NULL) || br != run_cnt * 512) return EIO;
 
         i += run_cnt;
     }
@@ -397,23 +417,34 @@ int VHDManager::BlockWrite(struct ext4_blockdev* bdev, const void* buf, uint64_t
             uint32_t oi = (uint32_t)(start_voff % g_dynVDI.block_size);
             if (bi >= g_dynVDI.blocks_in_image) return EIO;
             if (g_dynVDI.bat[bi] == 0xFFFFFFFF) {
+                bool has_alloc = false;
                 uint32_t max_blk = 0;
                 for (uint32_t j = 0; j < g_dynVDI.blocks_in_image; j++)
-                    if (g_dynVDI.bat[j] != 0xFFFFFFFF && g_dynVDI.bat[j] > max_blk) max_blk = g_dynVDI.bat[j];
-                uint32_t new_blk = max_blk + 1;
-                g_dynVDI.bat[bi] = new_blk;
+                    if (g_dynVDI.bat[j] != 0xFFFFFFFF) { if (!has_alloc || g_dynVDI.bat[j] > max_blk) max_blk = g_dynVDI.bat[j]; has_alloc = true; }
+                uint32_t new_blk = has_alloc ? (max_blk + 1) : 0;
                 LARGE_INTEGER bpos; bpos.QuadPart = (uint64_t)g_dynVDI.bat_offset + (uint64_t)bi * 4;
-                SetFilePointerEx(vhd->hFile, bpos, NULL, FILE_BEGIN);
-                DWORD bw3; WriteFile(vhd->hFile, &g_dynVDI.bat[bi], 4, &bw3, NULL);
+                if (!SetFilePointerEx(vhd->hFile, bpos, NULL, FILE_BEGIN)) return EIO;
+                DWORD bw3 = 0; if (!WriteFile(vhd->hFile, &new_blk, 4, &bw3, NULL) || bw3 != 4) return EIO;
                 std::vector<uint8_t> zeros(g_dynVDI.block_size, 0);
                 LARGE_INTEGER dpos; dpos.QuadPart = (uint64_t)g_dynVDI.data_offset + (uint64_t)new_blk * g_dynVDI.block_size;
-                SetFilePointerEx(vhd->hFile, dpos, NULL, FILE_BEGIN);
-                DWORD bw2; WriteFile(vhd->hFile, zeros.data(), g_dynVDI.block_size, &bw2, NULL);
+                if (!SetFilePointerEx(vhd->hFile, dpos, NULL, FILE_BEGIN)) { g_dynVDI.bat[bi] = 0xFFFFFFFF; return EIO; }
+                DWORD bw2 = 0;
+                // Write in chunks so a huge block size can't fail on one enormous WriteFile.
+                size_t off = 0;
+                while (off < zeros.size()) {
+                    DWORD chunk = (zeros.size() - off > 65536) ? 65536 : (DWORD)(zeros.size() - off);
+                    DWORD wc = 0;
+                    if (!WriteFile(vhd->hFile, zeros.data() + off, chunk, &wc, NULL) || wc != chunk) { g_dynVDI.bat[bi] = 0xFFFFFFFF; return EIO; }
+                    off += chunk;
+                }
+                if (!FlushFileBuffers(vhd->hFile)) { g_dynVDI.bat[bi] = 0xFFFFFFFF; return EIO; }
+                g_dynVDI.bat[bi] = new_blk;
             }
             start_poff = (uint64_t)g_dynVDI.data_offset + (uint64_t)g_dynVDI.bat[bi] * g_dynVDI.block_size + oi;
         } else if (g_dynVHD.is_dynamic) {
             uint32_t bi = (uint32_t)(start_voff / g_dynVHD.block_size);
             uint32_t oi = (uint32_t)(start_voff % g_dynVHD.block_size);
+            if (bi >= g_dynVHD.max_table_entries) return EIO;
             if (g_dynVHD.bat[bi] == 0xFFFFFFFF && !AllocateDynamicBlock(vhd->hFile, bi)) return EIO;
             uint32_t bm = (g_dynVHD.block_size/512+7)/8; bm=(bm+511)/512; if(bm==0) bm=1;
             start_poff = (uint64_t)g_dynVHD.bat[bi]*512 + (uint64_t)bm*512 + oi;
@@ -450,17 +481,26 @@ int VHDManager::BlockWrite(struct ext4_blockdev* bdev, const void* buf, uint64_t
         }
 
         LARGE_INTEGER li; li.QuadPart = start_poff;
-        SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN);
-        DWORD bw;
-        WriteFile(vhd->hFile, in + i*512, run_cnt * 512, &bw, NULL);
+        if (!SetFilePointerEx(vhd->hFile, li, NULL, FILE_BEGIN)) return EIO;
+        DWORD bw = 0;
+        if (!WriteFile(vhd->hFile, in + i*512, run_cnt * 512, &bw, NULL) || bw != run_cnt * 512) return EIO;
 
         i += run_cnt;
     }
-    FlushFileBuffers(vhd->hFile);
+    if (!FlushFileBuffers(vhd->hFile)) return EIO;
     return EOK;
 }
 
+bool VHDManager::FlushNoLock() {
+    if (!m_ext4_mounted) return true;
+    int rc = ext4_cache_flush("/");
+    if (rc != EOK) { m_last_error = MakeError("ext4_cache_flush failed: ", rc); return false; }
+    if (m_hVHD != INVALID_HANDLE_VALUE) FlushFileBuffers(m_hVHD);
+    return true;
+}
+
 bool VHDManager::MountExt4Partition(int idx) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (idx < 0 || idx >= (int)m_partitions.size()) { m_last_error = "Invalid partition index"; return false; }
     const PartitionInfo& p = m_partitions[idx]; if (!p.is_ext4) { m_last_error = "Partition is not ext4"; return false; }
     UnmountExt4();
@@ -478,59 +518,133 @@ bool VHDManager::MountExt4Partition(int idx) {
 }
 
 void VHDManager::UnmountExt4() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_ext4_mounted) return;
+    ext4_cache_flush("/");
+    if (m_hVHD != INVALID_HANDLE_VALUE) FlushFileBuffers(m_hVHD);
     ext4_umount("/"); ext4_device_unregister("vhd");
     if (m_bdif) delete[] m_bdif->ph_bbuf; delete m_bdif; delete m_ext4_bdev;
-    m_bdif = nullptr; m_ext4_bdev = nullptr; m_ext4_mounted = false;
+    m_bdif = nullptr; m_ext4_bdev = nullptr; m_ext4_mounted = false; m_mounted_partition_index = -1;
 }
 
-bool VHDManager::FileExists(const std::string& p) { ext4_file f; if (ext4_fopen(&f, p.c_str(), "rb") == EOK) { ext4_fclose(&f); return true; } return false; }
+bool VHDManager::FileExists(const std::string& p) { std::lock_guard<std::recursive_mutex> lock(m_mutex); ext4_file f; if (ext4_fopen(&f, p.c_str(), "rb") == EOK) { ext4_fclose(&f); return true; } return false; }
 
 bool VHDManager::CopyFileFromHost(const std::string& h, const std::string& e, ProgressCallback cb) {
-    FILE* hf = fopen(h.c_str(), "rb"); if (!hf) return false;
-    ext4_file ef; if (ext4_fopen(&ef, e.c_str(), "wb") != EOK) { fclose(hf); return false; }
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_ext4_mounted) { m_last_error = "No ext4 filesystem mounted"; return false; }
+    FILE* hf = fopen(h.c_str(), "rb");
+    if (!hf) { m_last_error = std::string("Cannot open host file: ") + h; return false; }
+    ext4_file ef;
+    int rc = ext4_fopen(&ef, e.c_str(), "wb");
+    if (rc != EOK) { m_last_error = MakeError("ext4 create failed: ", rc); fclose(hf); return false; }
     const size_t buf_size = 256 * 1024;
     std::vector<char> b(buf_size);
-    size_t br, bw;
+    size_t br = 0, bw = 0;
+    bool ok = true;
     while ((br = fread(b.data(), 1, buf_size, hf)) > 0) {
-        ext4_fwrite(&ef, b.data(), br, &bw);
-        if (cb) cb(br);
+        bw = 0;
+        rc = ext4_fwrite(&ef, b.data(), br, &bw);
+        if (rc != EOK || bw != br) {
+            m_last_error = MakeError("ext4 write failed (disk full or I/O error), code: ", rc);
+            ok = false;
+            break;
+        }
+        if (cb) cb(bw);
     }
-    fclose(hf); ext4_fclose(&ef); return true;
+    if (ferror(hf)) { m_last_error = std::string("Error reading host file: ") + h; ok = false; }
+    fclose(hf);
+    int crc = ext4_fclose(&ef);
+    if (crc != EOK && ok) { m_last_error = MakeError("ext4 close failed: ", crc); ok = false; }
+    // Make data durable so a remount/reopen sees the complete file.
+    if (!FlushNoLock() && ok) ok = false;
+    if (!ok) {
+        // Remove the truncated stub so the UI never shows a 0-byte ghost
+        // as if the copy had succeeded.
+        ext4_fremove(e.c_str());
+        FlushNoLock();
+        return false;
+    }
+    return true;
 }
 
 bool VHDManager::CopyFileToHost(const std::string& e, const std::string& h, ProgressCallback cb) {
-    ext4_file ef; if (ext4_fopen(&ef, e.c_str(), "rb") != EOK) return false;
-    FILE* hf = fopen(h.c_str(), "wb"); if (!hf) { ext4_fclose(&ef); return false; }
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_ext4_mounted) { m_last_error = "No ext4 filesystem mounted"; return false; }
+    ext4_file ef; int rc = ext4_fopen(&ef, e.c_str(), "rb");
+    if (rc != EOK) { m_last_error = MakeError("ext4 open failed: ", rc); return false; }
+    FILE* hf = fopen(h.c_str(), "wb"); if (!hf) { m_last_error = std::string("Cannot create host file: ") + h; ext4_fclose(&ef); return false; }
     const size_t buf_size = 256 * 1024;
     std::vector<char> b(buf_size);
-    size_t br;
-    while (ext4_fread(&ef, b.data(), buf_size, &br) == EOK && br > 0) {
-        fwrite(b.data(), 1, br, hf);
+    size_t br = 0;
+    bool ok = true;
+    while (true) {
+        br = 0;
+        rc = ext4_fread(&ef, b.data(), buf_size, &br);
+        if (rc != EOK) { m_last_error = MakeError("ext4 read failed: ", rc); ok = false; break; }
+        if (br == 0) break;
+        if (fwrite(b.data(), 1, br, hf) != br) { m_last_error = std::string("Error writing host file: ") + h; ok = false; break; }
         if (cb) cb(br);
     }
-    fclose(hf); ext4_fclose(&ef); return true;
+    ext4_fclose(&ef);
+    if (fclose(hf) != 0 && ok) { m_last_error = std::string("Error closing host file: ") + h; ok = false; }
+    if (!ok) remove(h.c_str());
+    return ok;
 }
 
 bool VHDManager::CopyInternal(const std::string& s, const std::string& d) {
-    ext4_file sf, df; if (ext4_fopen(&sf, s.c_str(), "rb") != EOK) return false;
-    if (ext4_fopen(&df, d.c_str(), "wb") != EOK) { ext4_fclose(&sf); return false; }
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_ext4_mounted) { m_last_error = "No ext4 filesystem mounted"; return false; }
+    if (s == d) { m_last_error = "Source and destination are the same"; return false; }
+    ext4_file sf, df; int rc = ext4_fopen(&sf, s.c_str(), "rb");
+    if (rc != EOK) { m_last_error = MakeError("ext4 open src failed: ", rc); return false; }
+    // If dst is an existing directory, ext4_fopen("wb") would fail or
+    // misbehave - refuse early with a clear message instead of truncating.
+    {
+        ext4_dir tmp;
+        if (ext4_dir_open(&tmp, d.c_str()) == EOK) {
+            ext4_dir_close(&tmp);
+            m_last_error = std::string("Destination is a directory: ") + d;
+            ext4_fclose(&sf);
+            return false;
+        }
+    }
+    if (rc != EOK) { m_last_error = MakeError("ext4 open src failed: ", rc); return false; }
+    rc = ext4_fopen(&df, d.c_str(), "wb");
+    if (rc != EOK) { m_last_error = MakeError("ext4 create dst failed: ", rc); ext4_fclose(&sf); return false; }
     const size_t buf_size = 256 * 1024;
     std::vector<char> b(buf_size);
-    size_t br, bw;
-    while (ext4_fread(&sf, b.data(), buf_size, &br) == EOK && br > 0) ext4_fwrite(&df, b.data(), br, &bw);
-    ext4_fclose(&sf); ext4_fclose(&df); return true;
+    size_t br = 0, bw = 0;
+    bool ok = true;
+    while (true) {
+        br = 0;
+        rc = ext4_fread(&sf, b.data(), buf_size, &br);
+        if (rc != EOK) { m_last_error = MakeError("ext4 read failed: ", rc); ok = false; break; }
+        if (br == 0) break;
+        bw = 0;
+        rc = ext4_fwrite(&df, b.data(), br, &bw);
+        if (rc != EOK || bw != br) { m_last_error = MakeError("ext4 write failed: ", rc); ok = false; break; }
+    }
+    ext4_fclose(&sf); ext4_fclose(&df);
+    if (!FlushNoLock() && ok) ok = false;
+    if (!ok) { ext4_fremove(d.c_str()); FlushNoLock(); return false; }
+    return true;
 }
 
 bool VHDManager::DeleteRecursive(const std::string& p) {
-    if (ext4_dir_rm(p.c_str()) == EOK) return true;
-    return ext4_fremove(p.c_str()) == EOK;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_ext4_mounted) { m_last_error = "No ext4 filesystem mounted"; return false; }
+    if (ext4_dir_rm(p.c_str()) == EOK) { FlushNoLock(); return true; }
+    int rc = ext4_fremove(p.c_str());
+    if (rc == EOK) { FlushNoLock(); return true; }
+    m_last_error = MakeError("delete failed: ", rc);
+    return false;
 }
 
 bool VHDManager::ExportRecursive(const std::string& e, const std::string& h, ProgressCallback cb) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     std::vector<FileInfo> entries;
     if (ListDirectoryInfo(e, entries)) {
-        if (!CreateDirectoryA(h.c_str(), NULL) && ::GetLastError() != ERROR_ALREADY_EXISTS) return false;
+        if (!CreateDirectoryA(h.c_str(), NULL) && ::GetLastError() != ERROR_ALREADY_EXISTS) { m_last_error = std::string("Cannot create host dir: ") + h; return false; }
         for (const auto& entry : entries) {
             std::string sub_e = e + (e.back() == '/' ? "" : "/") + entry.name;
             std::string sub_h = h + "\\" + entry.name;
@@ -543,28 +657,41 @@ bool VHDManager::ExportRecursive(const std::string& e, const std::string& h, Pro
 }
 
 bool VHDManager::ImportRecursive(const std::string& h, const std::string& e, ProgressCallback cb) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     DWORD attr = GetFileAttributesA(h.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    if (attr == INVALID_FILE_ATTRIBUTES) { m_last_error = std::string("Cannot access host path: ") + h; return false; }
     if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return CopyFileFromHost(h, e, cb);
-    
-    MakeDirectory(e);
+
+    // Create dest dir (ignore EEXIST - it may already be there from a
+    // previous partial import).
+    int mkrc = ext4_dir_mk(e.c_str());
+    if (mkrc != EOK) {
+        ext4_dir d;
+        if (ext4_dir_open(&d, e.c_str()) != EOK) { m_last_error = MakeError("cannot create ext4 dir: ", mkrc); return false; }
+        ext4_dir_close(&d);
+    }
     WIN32_FIND_DATAA fd;
     std::string search = h + "\\*";
     HANDLE hFind = FindFirstFileA(search.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return true;
+    if (hFind == INVALID_HANDLE_VALUE) { FlushNoLock(); return true; } // empty dir
+    bool ok = true;
     do {
         std::string n = fd.cFileName;
         if (n == "." || n == "..") continue;
         std::string sub_h = h + "\\" + n;
         std::string sub_e = e + (e.back() == '/' ? "" : "/") + n;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ImportRecursive(sub_h, sub_e, cb);
-        else CopyFileFromHost(sub_h, sub_e, cb);
+        bool child_ok = false;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) child_ok = ImportRecursive(sub_h, sub_e, cb);
+        else child_ok = CopyFileFromHost(sub_h, sub_e, cb);
+        if (!child_ok) { ok = false; break; }
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
-    return true;
+    FlushNoLock();
+    return ok;
 }
 
 uint64_t VHDManager::GetExt4SizeRecursive(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     std::vector<FileInfo> entries;
     uint64_t total_size = 0;
     if (ListDirectoryInfo(path, entries)) {
@@ -622,9 +749,17 @@ uint64_t VHDManager::GetHostSizeRecursive(const std::string& path) {
     return total_size;
 }
 
-bool VHDManager::Rename(const std::string& o, const std::string& n) { return ext4_frename(o.c_str(), n.c_str()) == EOK; }
+bool VHDManager::Rename(const std::string& o, const std::string& n) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (o == n) return true; // no-op: paste/move onto itself
+    int rc = ext4_frename(o.c_str(), n.c_str());
+    if (rc != EOK) { m_last_error = MakeError("rename failed: ", rc); return false; }
+    FlushNoLock();
+    return true;
+}
 
 bool VHDManager::ListDirectoryInfo(const std::string& path, std::vector<FileInfo>& entries) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     ext4_dir d; if (ext4_dir_open(&d, path.c_str()) != EOK) return false;
     const ext4_direntry* de; while ((de = ext4_dir_entry_next(&d)) != nullptr) {
         std::string n((char*)de->name, de->name_length); if (n == "." || n == "..") continue;
@@ -654,10 +789,21 @@ bool VHDManager::ListDirectoryInfo(const std::string& path, std::vector<FileInfo
     ext4_dir_close(&d); return true;
 }
 
-bool VHDManager::SetFilePermissions(const std::string& p, uint32_t m) { return ext4_mode_set(p.c_str(), m) == EOK; }
-bool VHDManager::SetFileOwner(const std::string& p, uint32_t u, uint32_t g) { return ext4_owner_set(p.c_str(), u, g) == EOK; }
+bool VHDManager::SetFilePermissions(const std::string& p, uint32_t m) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    int rc = ext4_mode_set(p.c_str(), m);
+    if (rc != EOK) { m_last_error = MakeError("chmod failed: ", rc); return false; }
+    FlushNoLock(); return true;
+}
+bool VHDManager::SetFileOwner(const std::string& p, uint32_t u, uint32_t g) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    int rc = ext4_owner_set(p.c_str(), u, g);
+    if (rc != EOK) { m_last_error = MakeError("chown failed: ", rc); return false; }
+    FlushNoLock(); return true;
+}
 
 bool VHDManager::SetPermissionsRecursive(const std::string& path, uint32_t mode, bool recurse) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     SetFilePermissions(path, mode);
     if (recurse) {
         std::vector<FileInfo> entries;
@@ -673,6 +819,7 @@ bool VHDManager::SetPermissionsRecursive(const std::string& path, uint32_t mode,
 }
 
 bool VHDManager::SetOwnerRecursive(const std::string& path, uint32_t uid, uint32_t gid, bool recurse) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     SetFileOwner(path, uid, gid);
     if (recurse) {
         std::vector<FileInfo> entries;
@@ -686,5 +833,10 @@ bool VHDManager::SetOwnerRecursive(const std::string& path, uint32_t uid, uint32
     }
     return true;
 }
-bool VHDManager::MakeDirectory(const std::string& p) { return ext4_dir_mk(p.c_str()) == EOK; }
+bool VHDManager::MakeDirectory(const std::string& p) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    int rc = ext4_dir_mk(p.c_str());
+    if (rc != EOK) { m_last_error = MakeError("mkdir failed: ", rc); return false; }
+    FlushNoLock(); return true;
+}
 void VHDManager::SetError(const std::string& e) { m_last_error = e; }
